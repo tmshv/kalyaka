@@ -9,7 +9,9 @@
   const INKS = [["#f2f6fb", "White"], ["#7fd1ff", "Cyan"], ["#ffcf5a", "Amber"], ["#ff7b6b", "Red"]];
   const PEOPLE_COLORS = ["#ffcf5a", "#ff7b6b", "#7ee0a1", "#c3a6ff", "#ff9fd1", "#7fd1ff", "#ffb36b", "#9be7e0"];
   const REACTIONS = ["👍", "😂", "🔥", "❤️", "💩"];
-  const KINDS = ["pen", "line", "arrow", "rect", "circle"];
+  const KINDS = ["pen", "line", "arrow", "rect", "circle", "dim"];
+  // Coordinates an item carries: pen grows, a dimension has two points and its offset.
+  const coordsOf = (k) => (k === "pen" ? 2 : k === "dim" ? 6 : 4);
   const ADJECTIVES = ["quiet", "brave", "steady", "lucky", "swift", "calm", "bold", "keen", "wise", "sunny", "rapid", "gentle", "sharp", "noble", "plain", "bright"];
   const ANIMALS = ["otter", "heron", "badger", "lynx", "falcon", "beaver", "walrus", "crane", "marten", "moose", "pelican", "owl", "narwhal", "wombat", "gecko", "yak"];
   const ARCHITECTS = ["corbusier", "mies", "gropius", "aalto", "wright", "gaudi", "hadid", "kahn", "niemeyer", "foster", "piano", "koolhaas", "siza", "ando", "utzon", "saarinen", "barragan", "zumthor", "melnikov", "shukhov", "leonidov", "ginzburg", "palladio", "brunelleschi"];
@@ -183,8 +185,52 @@
           g.arc(p[0], p[1], Math.hypot(p[2] - p[0], p[3] - p[1]), 0, Math.PI * 2);
           g.stroke();
           break;
+        case "dim": {
+          const d = dimension(p);
+          if (!d) break;
+          const { ax, ay, bx, by, ux, uy, nx, ny, side } = d;
+          const gap = 3, over = 6;
+          g.lineCap = "butt";
+          // Extension lines start just off the measured points and run past
+          // the dimension line, which itself runs past them.
+          if (Math.abs(d.off) > gap) {
+            g.moveTo(p[0] + nx * side * gap, p[1] + ny * side * gap); g.lineTo(ax + nx * side * over, ay + ny * side * over);
+            g.moveTo(p[2] + nx * side * gap, p[3] + ny * side * gap); g.lineTo(bx + nx * side * over, by + ny * side * over);
+          }
+          g.moveTo(ax - ux * over, ay - uy * over); g.lineTo(bx + ux * over, by + uy * over);
+          g.stroke();
+          // Architectural ticks: 45° slashes, a notch heavier than the line.
+          const tx = (ux + nx) * 4, ty = (uy + ny) * 4;
+          g.beginPath();
+          g.lineWidth = s.w + 1;
+          g.moveTo(ax - tx, ay - ty); g.lineTo(ax + tx, ay + ty);
+          g.moveTo(bx - tx, by - ty); g.lineTo(bx + tx, by + ty);
+          g.stroke();
+          // The length sits above the line, read from the bottom or the right
+          // as on a drawing: a vertical one runs bottom to top.
+          let angle = Math.atan2(uy, ux);
+          if (angle >= Math.PI / 2 - 1e-6 || angle < -Math.PI / 2 - 1e-6) angle += Math.PI;
+          g.translate((ax + bx) / 2, (ay + by) / 2);
+          g.rotate(angle);
+          g.font = '500 12px "Plex Condensed", "Plex Cyrillic", sans-serif';
+          g.textAlign = "center";
+          g.textBaseline = "bottom";
+          g.fillText(String(Math.round(d.len)), 0, -3);
+          break;
+        }
       }
       g.restore();
+    }
+
+    // An aligned dimension: p1 and p2 are measured, p3 sets how far off the
+    // line sits. Returns its geometry, or null while p1 and p2 coincide.
+    function dimension(p) {
+      const dx = p[2] - p[0], dy = p[3] - p[1];
+      const len = Math.hypot(dx, dy);
+      if (!len) return null;
+      const ux = dx / len, uy = dy / len, nx = -uy, ny = ux;
+      const off = (p[4] - p[0]) * nx + (p[5] - p[1]) * ny;
+      return { len, ux, uy, nx, ny, off, side: Math.sign(off) || 1, ax: p[0] + nx * off, ay: p[1] + ny * off, bx: p[2] + nx * off, by: p[3] + ny * off };
     }
 
     function render() {
@@ -198,6 +244,8 @@
       for (const s of items.values()) drawItem(ctx, s);
     }
     requestAnimationFrame(render);
+    // Dimension text is set in the page font; redraw once it has loaded.
+    if (document.fonts) document.fonts.ready.then(() => { dirty = true; });
 
     function addItem(s) {
       items.set(s.id, s);
@@ -210,7 +258,7 @@
       if (typeof id !== "string" || !KINDS.includes(k) || !Array.isArray(p)) return null;
       const pts = p.slice(0, MAX_POINTS * 2 + 2).map(Number);
       if (pts.length < 2 || pts.length % 2 || pts.some((v) => !Number.isFinite(v))) return null;
-      if (k !== "pen" && pts.length !== 4) return null;
+      if (k !== "pen" && pts.length !== coordsOf(k)) return null;
       return { id, by, k, c: /^#[0-9a-f]{6}$/i.test(c) ? c : INKS[0][0], w: Math.max(1, Math.min(8, Math.round(+w) || 1)), p: pts };
     }
 
@@ -232,11 +280,12 @@
           dirty = true;
           break;
         }
-        case "u": { // shape update: id, x1, y1, x2, y2
+        case "u": { // shape update: id, then all of the shape's coordinates
           const s = items.get(op[1]);
           if (!s || s.k === "pen") break;
-          const pts = op.slice(2, 6).map(Number);
-          if (pts.length === 4 && pts.every(Number.isFinite)) { s.p = pts; dirty = true; }
+          const n = coordsOf(s.k);
+          const pts = op.slice(2, 2 + n).map(Number);
+          if (pts.length === n && pts.every(Number.isFinite)) { s.p = pts; dirty = true; }
           break;
         }
         case "x":
@@ -504,7 +553,7 @@
       }
     });
 
-    const KEYS = { p: "pen", l: "line", a: "arrow", r: "rect", c: "circle", e: "erase" };
+    const KEYS = { p: "pen", l: "line", a: "arrow", r: "rect", c: "circle", d: "dim", e: "erase" };
     let spaceDown = false;
     let shiftDown = false;
     addEventListener("keydown", (e) => {
@@ -569,6 +618,10 @@
         }
         case "circle":
           return Math.abs(Math.hypot(x - p[0], y - p[1]) - Math.hypot(p[2] - p[0], p[3] - p[1])) <= r;
+        case "dim": {
+          const d = dimension(p);
+          return !!d && [[d.ax, d.ay, d.bx, d.by], [p[0], p[1], d.ax, d.ay], [p[2], p[3], d.bx, d.by]].some((e) => segmentDistance(x, y, ...e) <= r);
+        }
       }
       return false;
     }
@@ -583,10 +636,13 @@
       const id = rid();
       const k = tool.kind;
       const start = k === "pen" ? at : snapped(at);
-      const item = { id, by: myId, k, c: tool.ink, w: tool.weight, p: k === "pen" ? [start.x, start.y] : [start.x, start.y, start.x, start.y] };
+      const p = [];
+      for (let i = 0; i < coordsOf(k); i += 2) p.push(start.x, start.y);
+      const item = { id, by: myId, k, c: tool.ink, w: tool.weight, p };
       addItem(item);
       mine.push(id);
-      drawing = { item, sent: false, sentPoints: 0, changed: false };
+      // A dimension is placed in stages: 1 follows its second point, 2 its offset.
+      drawing = { item, sent: false, sentPoints: 0, changed: false, stage: 1 };
       // A pen dot is worth sending at once; a shape waits until it has size.
       if (k === "pen") flushDrawing();
     }
@@ -594,7 +650,7 @@
     function constrain(p, at) {
       const k = drawing.item.k;
       let { x, y } = snapped(at);
-      if (shiftDown && (k === "line" || k === "arrow")) {
+      if (shiftDown && (k === "line" || k === "arrow" || k === "dim")) {
         const len = Math.hypot(x - p[0], y - p[1]);
         const a = Math.round(Math.atan2(y - p[1], x - p[0]) / (Math.PI / 12)) * (Math.PI / 12);
         x = Math.round(p[0] + len * Math.cos(a));
@@ -618,6 +674,15 @@
           startDrawing(last);
         }
         drawing.item.p.push(at.x, at.y);
+      } else if (s.k === "dim") {
+        const end = drawing.stage === 1 ? constrain(p, at) : snapped(at);
+        const i = drawing.stage === 1 ? 2 : 4;
+        if (end.x === p[i] && end.y === p[i + 1]) return;
+        p[i] = end.x;
+        p[i + 1] = end.y;
+        // Until the offset is set, the dimension line lies on the points.
+        if (drawing.stage === 1) { p[4] = end.x; p[5] = end.y; }
+        drawing.changed = true;
       } else {
         const end = constrain(p, at);
         if (end.x === p[2] && end.y === p[3]) return;
@@ -639,7 +704,7 @@
       const s = drawing.item;
       if (!drawing.sent) {
         if (!hasSize(s)) return;
-        out.push(["s", s.id, s.k, s.c, s.w, ...s.p.slice(0, s.k === "pen" ? 2 : 4)]);
+        out.push(["s", s.id, s.k, s.c, s.w, ...s.p.slice(0, coordsOf(s.k))]);
         drawing.sent = true;
         drawing.sentPoints = 1;
         drawing.changed = false;
@@ -721,6 +786,13 @@
       }
       if (e.button !== 0) return;
       const at = world(e);
+      if (drawing && drawing.item.k === "dim") {
+        // Second click fixes the measured length, third places the line.
+        extendDrawing(at);
+        if (drawing.stage === 1) { if (hasSize(drawing.item)) drawing.stage = 2; }
+        else endDrawing();
+        return;
+      }
       if (tool.kind === "erase") eraseAt(at);
       else startDrawing(at);
     });
@@ -756,6 +828,12 @@
         if (!pan.touch || touches.size === 0) { pan = null; board.classList.remove("panning"); }
         return;
       }
+      if (drawing && drawing.item.k === "dim") {
+        // Dragging out the first two points (as on touch) skips the second click.
+        const p = drawing.item.p;
+        if (drawing.stage === 1 && Math.hypot(p[2] - p[0], p[3] - p[1]) > 4) drawing.stage = 2;
+        return;
+      }
       endDrawing();
     }
     canvas.addEventListener("pointerup", release);
@@ -781,7 +859,11 @@
       };
       for (const s of items.values()) {
         if (s.k === "circle") grow(s.p[0], s.p[1], Math.hypot(s.p[2] - s.p[0], s.p[3] - s.p[1]));
-        else for (let i = 0; i < s.p.length; i += 2) grow(s.p[i], s.p[i + 1]);
+        else if (s.k === "dim") {
+          const d = dimension(s.p);
+          if (d) { grow(d.ax, d.ay, 20); grow(d.bx, d.by, 20); }
+          grow(s.p[0], s.p[1]); grow(s.p[2], s.p[3]);
+        } else for (let i = 0; i < s.p.length; i += 2) grow(s.p[i], s.p[i + 1]);
       }
       x0 = Math.floor(x0 / MAJOR) * MAJOR - GRID * 2;
       y0 = Math.floor(y0 / MAJOR) * MAJOR - GRID * 2;
