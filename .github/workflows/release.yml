@@ -1,0 +1,76 @@
+name: release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+
+      - name: Test
+        run: just test
+
+      - name: Build archives
+        run: just dist
+
+      - name: Write release notes
+        env:
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          # The release before this one: the tag sorted just below it.
+          prev="$(git tag --list 'v[0-9]*' --merged "$TAG" --sort=v:refname | awk -v t="$TAG" '$0 == t { print p; exit } { p = $0 }')"
+          range="${prev:+$prev..}$TAG"
+          changes="$(git log --no-merges --format='- %s (%h)' "$range")"
+          {
+            echo "## Changes"
+            echo
+            echo "${changes:-- No code changes since $prev.}"
+            echo
+            if [ -n "$prev" ]; then
+              echo "**Full diff:** https://github.com/$REPO/compare/$prev...$TAG"
+              echo
+            fi
+            echo "## Downloads"
+            echo
+            echo "| Platform | Archive |"
+            echo "| -------- | ------- |"
+            for f in dist/*.tar.gz; do
+              name="$(basename "$f")"
+              platform="$(echo "$name" | sed -E 's/^kalyaka_[^_]+_(.+)\.tar\.gz$/\1/; s/_/\//')"
+              echo "| \`$platform\` | [$name](https://github.com/$REPO/releases/download/$TAG/$name) |"
+            done
+            echo
+            echo "Built with $(go version | cut -d' ' -f3). Verify downloads against \`checksums.txt\`:"
+            echo
+            echo '```'
+            cat dist/checksums.txt
+            echo '```'
+          } > dist/NOTES.md
+          cat dist/NOTES.md
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            --title "kalyaka $TAG" \
+            --notes-file dist/NOTES.md \
+            --verify-tag \
+            dist/*.tar.gz dist/checksums.txt
