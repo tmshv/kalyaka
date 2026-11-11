@@ -1,4 +1,4 @@
-// Command draw serves kalyaka: a shared drawing sheet where everyone in a room
+// Command kalyaka serves a shared drawing sheet where everyone in a room
 // draws on the same page in real time. Nothing is stored. The server only
 // relays messages between the people in a room, and a room exists only while
 // someone is in it.
@@ -11,6 +11,7 @@ import (
 	"embed"
 	"encoding/hex"
 	"flag"
+	"fmt"
 	"io/fs"
 	"log"
 	"net"
@@ -28,9 +29,18 @@ import (
 //go:embed web
 var webFS embed.FS
 
+// buildVersion is set at build time with -ldflags "-X main.buildVersion=...".
+var buildVersion = "dev"
+
 func main() {
 	listen := flag.String("listen", "127.0.0.1:20480", "address to serve HTTP on")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(buildVersion)
+		return
+	}
 
 	node, err := centrifuge.New(centrifuge.Config{
 		LogLevel:           centrifuge.LogLevelError,
@@ -54,13 +64,43 @@ func main() {
 		MessageSizeLimit: maxSnapshot + 4096,
 		ReadBufferSize:   4096,
 		WriteBufferSize:  4096,
-		// Caddy checks the host; the origin must be the page itself.
+		// The reverse proxy checks the host; the origin must be the page itself.
 		CheckOrigin: sameOrigin,
 	})
 
 	web, _ := fs.Sub(webFS, "web")
+	mux, err := newMux(web, hub.admit(ws))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	srv := &http.Server{
+		Addr:              *listen,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
+	go func() {
+		log.Printf("kalyaka %s listening on %s", buildVersion, *listen)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = node.Shutdown(ctx)
+	_ = srv.Shutdown(ctx)
+}
+
+// newMux routes the page, its assets and the WebSocket endpoint.
+func newMux(web fs.FS, ws http.Handler) (*http.ServeMux, error) {
 	mux := http.NewServeMux()
-	mux.Handle("/connection/websocket", hub.admit(ws))
+	mux.Handle("/connection/websocket", ws)
 	mux.Handle("/static/", http.StripPrefix("/static/", static(web)))
 	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -69,11 +109,11 @@ func main() {
 	})
 	index, err := fs.ReadFile(web, "index.html")
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 	// Asset URLs carry a hash of the assets, so a deploy reaches every
 	// browser at once while the files themselves cache for long.
-	index = bytes.ReplaceAll(index, []byte("__V__"), []byte(version(web)))
+	index = bytes.ReplaceAll(index, []byte("__V__"), []byte(assetHash(web)))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		// Every single-segment path is a room; the page reads it from the URL.
 		if strings.Count(r.URL.Path, "/") > 1 {
@@ -90,28 +130,7 @@ func main() {
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data: blob:; style-src 'self'; frame-ancestors 'none'")
 		_, _ = w.Write(index)
 	})
-
-	srv := &http.Server{
-		Addr:              *listen,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    16 << 10,
-	}
-	go func() {
-		log.Printf("listening on %s", *listen)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatal(err)
-		}
-	}()
-
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = node.Shutdown(ctx)
-	_ = srv.Shutdown(ctx)
+	return mux, nil
 }
 
 // static serves the embedded assets. The page links them with ?v=<hash>.
@@ -127,7 +146,8 @@ func static(web fs.FS) http.Handler {
 	})
 }
 
-func version(web fs.FS) string {
+// assetHash is a short hash over every embedded asset's name and contents.
+func assetHash(web fs.FS) string {
 	h := sha256.New()
 	_ = fs.WalkDir(web, ".", func(name string, d fs.DirEntry, err error) error {
 		if err == nil && !d.IsDir() {
@@ -149,8 +169,9 @@ func sameOrigin(r *http.Request) bool {
 	return ok && strings.EqualFold(host, r.Host)
 }
 
-// clientIP is the visitor's address. Caddy, the only thing in front of this
-// server, replaces X-Forwarded-For with the address it sees.
+// clientIP is the visitor's address. The server expects to run behind a
+// reverse proxy that replaces X-Forwarded-For with the address it sees;
+// exposed directly, a client could set the header and dodge the per-IP cap.
 func clientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		first, _, _ := strings.Cut(xff, ",")

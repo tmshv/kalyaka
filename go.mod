@@ -1,4 +1,4 @@
-module sektavpn/draw
+module github.com/tmshv/kalyaka
 
 go 1.27.3
 
